@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""macro_data.py 回归测试（不联网，urlopen 被替换为本地假响应；数值仅为测试样例）。
+
+运行：  python tests/test_macro_data.py
+"""
+
+import contextlib
+import io
+import json
+import os
+import sys
+import unittest
+import urllib.error
+from unittest import mock
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools'))
+
+import macro_data as M  # noqa: E402
+
+
+class _Resp(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _fake_api(routes, seen):
+    """按路径前缀返回假 JSON；未登记的路径返回 404。"""
+    def urlopen(req, timeout=None):
+        seen.append(req)
+        path = req.full_url.split('/v1', 1)[1].split('?')[0]
+        if path not in routes:
+            raise urllib.error.HTTPError(req.full_url, 404, 'Not Found', {}, None)
+        body = routes[path]
+        if isinstance(body, int):
+            raise urllib.error.HTTPError(req.full_url, body, 'Forbidden', {}, None)
+        return _Resp(json.dumps(body).encode('utf-8'))
+    return urlopen
+
+
+CATALOGUE = {
+    'policy_rate': {'name': 'Policy Rate', 'unit': '%', 'frequency': 'Irregular'},
+    'inflation': {'name': 'Inflation', 'unit': '%YoY', 'frequency': 'Monthly'},
+}
+ROUTES = {
+    '/data_catalogue/usd': CATALOGUE,
+    '/announcements/usd/policy_rate': {'data': [
+        {'date': '2026-09-17', 'val': 1.5}, {'date': '2026-07-30', 'val': 1.75}]},
+    '/announcements/usd/inflation': {'data': [
+        {'date': '2026-09-01', 'val': 2.2, 'previous_value': 2.4}]},
+    '/calendar/usd': {'data': [
+        {'announcement_datetime': 1792845000, 'release': 'inflation', 'time_announced': True},
+        {'announcement_date': '2026-11-02', 'release': 'gdp', 'time_announced': False}]},
+}
+
+
+class MacroDataTest(unittest.TestCase):
+
+    def run_cmd(self, fn, *args, routes=ROUTES, key=None):
+        seen, out = [], io.StringIO()
+        env = {'FXMACRODATA_API_KEY': key} if key else {}
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(M, '_KEY_FILE', '/nonexistent/key.txt'), \
+                mock.patch.object(M.urllib.request, 'urlopen', _fake_api(routes, seen)), \
+                contextlib.redirect_stdout(out):
+            if not key:
+                os.environ.pop('FXMACRODATA_API_KEY', None)
+            fn(*args)
+        return out.getvalue(), seen
+
+    def test_snapshot_only_requests_catalogued_indicators(self):
+        text, seen = self.run_cmd(M.cmd_snapshot, 'usd')
+        paths = [r.full_url.split('/v1', 1)[1].split('?')[0] for r in seen]
+        self.assertNotIn('/announcements/usd/gdp', paths)
+        self.assertIn('1.5', text)
+        self.assertIn('1.75', text)
+        self.assertIn('2.4', text)      # 只有一期时用 previous_value
+        self.assertIn('2026-10-24 12:30 UTC', text)
+        self.assertIn('2026-11-02 (时间未公布)', text)
+
+    def test_key_goes_in_header_not_url(self):
+        _, seen = self.run_cmd(M.cmd_indicator, 'usd', 'inflation', 3, key='test-key')
+        for req in seen:
+            self.assertNotIn('test-key', req.full_url)
+            self.assertEqual(req.get_header('X-api-key'), 'test-key')
+
+    def test_keyless_non_usd_explains_subscription(self):
+        routes = dict(ROUTES, **{'/announcements/eur/inflation': 403})
+        with self.assertRaises(ConnectionError) as ctx:
+            self.run_cmd(M.cmd_indicator, 'eur', 'inflation', 3, routes=routes)
+        self.assertIn('USD', str(ctx.exception))
+
+    def test_fx_one_year_change(self):
+        calls = []
+
+        def answers(req, timeout=None):
+            calls.append(req.full_url)
+            val = 100.0 if 'end_date' in req.full_url else 110.0
+            return _Resp(json.dumps({'data': [{'date': '2025-10-14', 'val': val}]}).encode())
+        out = io.StringIO()
+        with mock.patch.object(M.urllib.request, 'urlopen', answers), \
+                contextlib.redirect_stdout(out):
+            M.cmd_fx('usd', 'jpy')
+        self.assertEqual(len(calls), 2)
+        self.assertIn('+10.00%', out.getvalue())
+
+
+if __name__ == '__main__':
+    unittest.main()
