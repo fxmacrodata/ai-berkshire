@@ -104,10 +104,7 @@ def _series(currency, indicator, n=2):
 
 
 def _catalogue(currency):
-    try:
-        return _get(f"/data_catalogue/{currency.lower()}") or {}
-    except ConnectionError:
-        return {}
+    return _get(f"/data_catalogue/{currency.lower()}") or {}
 
 
 def _fmt(v):
@@ -204,7 +201,9 @@ def cmd_fx(base, quote):
     if not latest:
         print(f"未找到 {base}/{quote} 的汇率数据")
         return
-    year_ago = (_get(path, end_date=_days_ago(365), limit=1) or {}).get("data") or []
+    year_ago = (_get(
+        path, start_date=_days_ago(372), end_date=_days_ago(365), limit=1,
+    ) or {}).get("data") or []
 
     now = latest[0]
     print("=" * 60)

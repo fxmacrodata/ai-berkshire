@@ -11,6 +11,8 @@ import os
 import sys
 import unittest
 import urllib.error
+import urllib.parse
+from datetime import date
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools'))
@@ -105,6 +107,73 @@ class MacroDataTest(unittest.TestCase):
             M.cmd_fx('usd', 'jpy')
         self.assertEqual(len(calls), 2)
         self.assertIn('+10.00%', out.getvalue())
+
+
+    def test_fx_anniversary_uses_prior_business_day(self):
+        class FrozenDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 10, 19)
+
+        for historical_date in ('2025-10-17', '2025-10-16'):
+            with self.subTest(historical_date=historical_date):
+                calls = []
+
+                def answers(req, timeout=None):
+                    query = urllib.parse.parse_qs(urllib.parse.urlsplit(req.full_url).query)
+                    calls.append(query)
+                    if 'end_date' in query:
+                        start = query.get('start_date', ['2025-10-19'])[0]
+                        end = query['end_date'][0]
+                        rows = ([{'date': historical_date, 'val': 100.0}]
+                                if start <= historical_date <= end else [])
+                    else:
+                        rows = [{'date': '2026-10-19', 'val': 110.0}]
+                    return _Resp(json.dumps({'data': rows}).encode())
+
+                out = io.StringIO()
+                with mock.patch.object(M, 'date', FrozenDate), \
+                        mock.patch.object(M, '_api_key', return_value=None), \
+                        mock.patch.object(M.urllib.request, 'urlopen', answers), \
+                        contextlib.redirect_stdout(out):
+                    M.cmd_fx('usd', 'jpy')
+                self.assertEqual(calls[1], {
+                    'start_date': ['2025-10-12'],
+                    'end_date': ['2025-10-19'], 'limit': ['1'],
+                })
+                self.assertIn(historical_date, out.getvalue())
+                self.assertIn('+10.00%', out.getvalue())
+
+    def test_catalogue_transport_errors_exit_cli_with_failure(self):
+        for command in (['catalogue', 'USD'], ['indicator', 'USD', 'inflation'],
+                        ['snapshot', 'USD']):
+            for error in (urllib.error.HTTPError('https://example.test', 429,
+                                                 'Too Many Requests', {}, None),
+                          urllib.error.URLError('offline')):
+                with self.subTest(command=command, error=type(error).__name__):
+                    def answers(req, timeout=None):
+                        if '/data_catalogue/' in req.full_url:
+                            raise error
+                        return _Resp(json.dumps({'data': [
+                            {'date': '2026-10-01', 'val': 2.2},
+                        ]}).encode())
+
+                    out = io.StringIO()
+                    with mock.patch.object(sys, 'argv', ['macro_data.py'] + command), \
+                            mock.patch.object(M, '_api_key', return_value=None), \
+                            mock.patch.object(M.urllib.request, 'urlopen', answers), \
+                            contextlib.redirect_stdout(out), \
+                            self.assertRaises(SystemExit) as raised:
+                        M.main()
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertIn('HTTP 429' if isinstance(error, urllib.error.HTTPError)
+                                  else 'offline', out.getvalue())
+                    self.assertNotIn('2.2', out.getvalue())
+
+    def test_catalogue_not_found_remains_empty(self):
+        text, _ = self.run_cmd(M.cmd_catalogue, 'usd',
+                               routes={'/data_catalogue/usd': 404})
+        self.assertIn('USD', text)
 
 
 if __name__ == '__main__':
