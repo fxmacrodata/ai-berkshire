@@ -167,13 +167,56 @@ class MacroDataTest(unittest.TestCase):
                         M.main()
                     self.assertEqual(raised.exception.code, 2)
                     self.assertIn('HTTP 429' if isinstance(error, urllib.error.HTTPError)
-                                  else 'offline', out.getvalue())
+                                  else '网络请求失败', out.getvalue())
                     self.assertNotIn('2.2', out.getvalue())
 
     def test_catalogue_not_found_remains_empty(self):
         text, _ = self.run_cmd(M.cmd_catalogue, 'usd',
                                routes={'/data_catalogue/usd': 404})
         self.assertIn('USD', text)
+
+
+class RequestBoundaryTest(unittest.TestCase):
+    def test_key_is_not_forwarded_by_urllib_redirects(self):
+        seen = []
+        with mock.patch.object(M, '_api_key', return_value='fixture-key'), \
+                mock.patch.object(M.urllib.request, 'urlopen', _fake_api(ROUTES, seen)):
+            M._get('/calendar/usd')
+        redirected = M.urllib.request.HTTPRedirectHandler().redirect_request(
+            seen[0], None, 302, 'Found', {}, 'https://other.example/calendar')
+        self.assertIsNone(redirected.get_header('X-api-key'))
+
+    def test_malformed_key_is_rejected_without_echo(self):
+        with mock.patch.object(M, '_api_key', return_value='fixture-key\r\nX-Other: value'), \
+                mock.patch.object(M.urllib.request, 'urlopen') as transport:
+            with self.assertRaises(ValueError) as raised:
+                M._get('/calendar/usd')
+        self.assertNotIn('fixture-key', str(raised.exception))
+        transport.assert_not_called()
+
+    def test_error_and_scalar_payloads_are_rejected(self):
+        for payload in ({'detail': 'fixture-private-value'}, {'error': 'fixture-private-value'}, None, 'text', []):
+            with self.subTest(payload=payload), \
+                    mock.patch.object(M, '_api_key', return_value=None), \
+                    mock.patch.object(M.urllib.request, 'urlopen', return_value=_Resp(json.dumps(payload).encode())):
+                with self.assertRaises(ValueError) as raised:
+                    M._get('/calendar/usd')
+                self.assertNotIn('fixture-private-value', str(raised.exception))
+
+    def test_private_transport_reasons_are_not_in_tracebacks(self):
+        import traceback
+        errors = [urllib.error.URLError('fixture-private-value'),
+                  urllib.error.HTTPError('https://example.invalid', 500, 'fixture-private-value', {}, None)]
+        for error in errors:
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch.object(M, '_api_key', return_value=None), \
+                    mock.patch.object(M.urllib.request, 'urlopen', side_effect=error):
+                try:
+                    M._get('/calendar/usd')
+                except ConnectionError as exc:
+                    self.assertNotIn('fixture-private-value', ''.join(traceback.format_exception(exc)))
+                else:
+                    self.fail('transport failure was suppressed')
 
 
 if __name__ == '__main__':

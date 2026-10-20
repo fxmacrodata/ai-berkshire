@@ -73,13 +73,15 @@ def _get(path, **params):
     if params:
         url += "?" + urllib.parse.urlencode(params)
     headers = {"User-Agent": "ai-berkshire-macro-data", "Accept": "application/json"}
-    key = _api_key()
-    if key:
-        headers["X-API-Key"] = key
+    key = (_api_key() or "").strip()
+    if any(ch.isspace() or not ch.isprintable() for ch in key):
+        raise ValueError("FXMacroData API key contains whitespace or control characters")
     req = urllib.request.Request(url, headers=headers)
+    if key:
+        req.add_unredirected_header("X-API-Key", key)
     try:
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None
@@ -89,10 +91,15 @@ def _get(path, **params):
                 if key else
                 f"未配置 API key 时只能访问 USD 数据；其他货币和汇率需要 key（{_SUBSCRIBE}）"
             )
-            raise ConnectionError(f"FXMacroData 拒绝请求（HTTP {e.code}）：{hint}") from e
-        raise ConnectionError(f"FXMacroData 请求失败: HTTP {e.code} ({path})") from e
-    except urllib.error.URLError as e:
-        raise ConnectionError(f"FXMacroData 网络请求失败: {e.reason}") from e
+            raise ConnectionError(f"FXMacroData 拒绝请求（HTTP {e.code}）：{hint}") from None
+        raise ConnectionError(f"FXMacroData 请求失败: HTTP {e.code} ({path})") from None
+    except urllib.error.URLError:
+        raise ConnectionError("FXMacroData 网络请求失败") from None
+    except (ValueError, UnicodeError):
+        raise ValueError("FXMacroData returned invalid JSON") from None
+    if not isinstance(payload, dict) or "detail" in payload or "error" in payload:
+        raise ValueError("FXMacroData returned an error or invalid response")
+    return payload
 
 
 def _series(currency, indicator, n=2):
